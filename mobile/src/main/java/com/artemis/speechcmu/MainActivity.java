@@ -1,11 +1,16 @@
 package com.artemis.speechcmu;
 
 import android.Manifest;
+import android.content.Context;
 import android.content.pm.PackageManager;
 import android.graphics.Color;
+import android.location.LocationListener;
+import android.location.LocationManager;
 import android.net.Uri;
 import android.os.AsyncTask;
 import android.os.SystemClock;
+import android.support.annotation.NonNull;
+import android.support.annotation.Nullable;
 import android.support.v4.app.ActivityCompat;
 import android.support.v4.content.ContextCompat;
 import android.support.v7.app.AppCompatActivity;
@@ -15,16 +20,21 @@ import android.content.Intent;
 import android.speech.RecognizerIntent;
 import android.speech.tts.TextToSpeech;
 
-import com.artemis.speechcmu.models.HubRequest;
+import com.artemis.speechcmu.models.HandleInputRequest;
 import com.artemis.speechcmu.models.HubResponse;
-import com.artemis.speechcmu.services.HandleResultTask;
-import com.artemis.speechcmu.services.OnTaskCompleted;
-import com.artemis.speechcmu.services.PostureDetectionService;
+import com.artemis.speechcmu.models.Location;
+import com.artemis.speechcmu.models.NotifyRequest;
+import com.artemis.speechcmu.services.falldetect.FallDetectListener;
+import com.artemis.speechcmu.services.web.HubRequestTask;
+import com.artemis.speechcmu.services.web.OnTaskCompleted;
+import com.artemis.speechcmu.services.falldetect.PostureDetectionService;
 import com.github.lzyzsd.circleprogress.DonutProgress;
 import com.google.android.gms.appindexing.Action;
 import com.google.android.gms.appindexing.AppIndex;
 import com.google.android.gms.appindexing.Thing;
+import com.google.android.gms.common.ConnectionResult;
 import com.google.android.gms.common.api.GoogleApiClient;
+import com.google.android.gms.location.LocationServices;
 
 import java.io.File;
 import java.io.IOException;
@@ -37,9 +47,11 @@ import edu.cmu.pocketsphinx.SpeechRecognizerSetup;
 
 public class MainActivity extends AppCompatActivity {
 
+    private boolean isLocationAvail = false;
+    private LocationManager locationManager;
     private static final String KWS_SEARCH = "artemis";
     private static final String KEYPHRASE = "artemis";
-    private static final String HOST_ADDRESS = "";
+    private static final int REQUEST_LOCATION = 2;
 
     private edu.cmu.pocketsphinx.SpeechRecognizer sphinxRecognizer;
     private android.speech.SpeechRecognizer googleRecognizer;
@@ -66,14 +78,25 @@ public class MainActivity extends AppCompatActivity {
 
         progressView = (DonutProgress) findViewById(R.id.donut_progress);
 
-        postureService = new PostureDetectionService(this);
+        createLocationService();
+        createFallDetectionService();
 
-        setupRecognizer();
+        createSpeechRecognizer();
         createGoogleRecognizer();
         createGoogleTTS();
         // ATTENTION: This was auto-generated to implement the App Indexing API.
         // See https://g.co/AppIndexing/AndroidStudio for more information.
         client = new GoogleApiClient.Builder(this).addApi(AppIndex.API).build();
+    }
+
+    private void createFallDetectionService() {
+        postureService = new PostureDetectionService(this);
+        postureService.setFallDetectListener(new FallDetectListener() {
+            @Override
+            public void onFallDetected() {
+                sendJasperNotification();
+            }
+        });
     }
 
     private void checkRecordPermission() {
@@ -107,7 +130,44 @@ public class MainActivity extends AppCompatActivity {
         });
     }
 
-    private void setupRecognizer() {
+    private void createLocationService() {
+        locationManager = (LocationManager) this.getSystemService(Context.LOCATION_SERVICE);
+
+// Define a listener that responds to location updates
+        LocationListener locationListener = new LocationListener() {
+            @Override
+            public void onLocationChanged(android.location.Location location) {
+
+            }
+
+            @Override
+            public void onStatusChanged(String provider, int status, Bundle extras) {
+
+            }
+
+            @Override
+            public void onProviderEnabled(String provider) {
+
+            }
+
+            @Override
+            public void onProviderDisabled(String provider) {
+
+            }
+        };
+        if (ActivityCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION)
+                != PackageManager.PERMISSION_GRANTED) {
+            // Check Permissions Now
+            ActivityCompat.requestPermissions(this,
+                    new String[]{Manifest.permission.ACCESS_FINE_LOCATION},
+                    REQUEST_LOCATION);
+        } else {
+            // Register the listener with the Location Manager to receive location updates
+            locationManager.requestLocationUpdates(LocationManager.GPS_PROVIDER, 0, 0, locationListener);
+        }
+    }
+
+    private void createSpeechRecognizer() {
         // Recognizer initialization is a time-consuming and it involves IO,
         // so we execute it in async task
         progressView.setProgress(0);
@@ -178,16 +238,35 @@ public class MainActivity extends AppCompatActivity {
         sphinxRecognizer.startListening(searchName);
     }
 
-    private void sendTextToJasper(String text) {
-        HubRequest model = new HubRequest();
+    private void sendJasperText(String text) {
+        HandleInputRequest model = new HandleInputRequest();
         model.setText(text);
-        HandleResultTask task = new HandleResultTask(new OnTaskCompleted() {
+        HubRequestTask task = new HubRequestTask(HubRequestTask.API_HANDLEINPUT, new OnTaskCompleted() {
             @Override
             public void onTaskCompleted(Object result) {
             speakToUser((HubResponse) result);
             }
         });
         task.execute(model);
+    }
+
+    private void sendJasperNotification() {
+        // Get current location
+            // permission has been granted, continue as usual
+        String locationProvider = LocationManager.GPS_PROVIDER;
+        android.location.Location mLastLocation = locationManager.getLastKnownLocation(locationProvider);
+        if (mLastLocation != null) {
+            NotifyRequest model = new NotifyRequest();
+            model.setEvent("FALL");
+            model.setLocation(new Location(mLastLocation.getLatitude(), mLastLocation.getLongitude()));
+            HubRequestTask task = new HubRequestTask(HubRequestTask.API_NOTIFY, new OnTaskCompleted() {
+                @Override
+                public void onTaskCompleted(Object result) {
+                    speakToUser((HubResponse) result);
+                }
+            });
+            task.execute(model);
+        }
     }
 
     private void speakToUser(HubResponse response) {
@@ -318,7 +397,7 @@ public class MainActivity extends AppCompatActivity {
             if(!matches.isEmpty()) {
                 text = matches.get(0);
                 // TODO: comment out for production
-                sendTextToJasper(text);
+                sendJasperText(text);
 //                speakToUser(new HubResponse(text, true));
 
             }
